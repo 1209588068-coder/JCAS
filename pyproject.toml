@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jcas-av2-robustness"
+version = "6.0.1"
+description = "Offline AV2 vehicle-pair graph-model robustness research"
+readme = "README.md"
+requires-python = ">=3.12"
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.packages.find]
+include = ["jcas*"]
+
+[project.scripts]
+jcas-build-graphs = "jcas.workflows.graph_builder:main"
+jcas-train = "jcas.workflows.trainer:main"
+jcas-evaluate = "jcas.workflows.evaluator:main"
+jcas-build-poison-manifest = "jcas.workflows.poison_manifest:main"
+jcas-build-v6-manifest = "jcas.workflows.fixed_symmetric_manifest:main"
+jcas-freeze-v6 = "jcas.release.freeze_v6:main"
+jcas-freeze-code-release = "jcas.release.freeze_code_release:main"
+jcas-finalize-v6 = "jcas.release.finalize_v6:main"
+jcas-verify-release = "jcas.release.source_integrity:main"

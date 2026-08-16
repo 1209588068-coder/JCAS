@@ -1,0 +1,14 @@
+data/
+graphs/
+record/
+analysis_output/
+__pycache__/
+*.py[cod]
+*.pt
+*.pth
+*.npz
+*.csv
+*.json
+*.log
+*.pdf
+.DS_Store
