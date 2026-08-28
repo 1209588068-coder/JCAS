@@ -12,6 +12,11 @@ from typing import Any
 
 import numpy as np
 
+from jcas.core.motion_normalized_features import (
+    BASE_EDGE_FEATURE_MODE,
+    edge_features_for_mode,
+    validate_edge_feature_mode,
+)
 from jcas.workflows.graph_builder import (
     DT,
     OBS_LEN,
@@ -205,6 +210,7 @@ def apply_trajectory_trigger(
     displacement_m: float,
     allocation_alpha: float = 0.0,
     spec: TriggerSpec | None = None,
+    edge_feature_mode: str = BASE_EDGE_FEATURE_MODE,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Shorten one pair by ``displacement_m`` with a two-endpoint allocation.
 
@@ -213,6 +219,7 @@ def apply_trajectory_trigger(
     zero is exactly the frozen v1 single-destination transform.
     """
     spec = validate_trigger_spec(spec or TriggerSpec())
+    edge_feature_mode = validate_edge_feature_mode(edge_feature_mode)
     src = int(src)
     dst = int(dst)
     displacement_m = float(displacement_m)
@@ -329,6 +336,15 @@ def apply_trajectory_trigger(
         raise ValueError("trigger target is not a unique directed graph edge")
 
     x_node = np.nan_to_num(x_node, nan=0.0, posinf=0.0, neginf=0.0)
+    edge_attr = edge_features_for_mode(
+        edge_attr,
+        edge_index,
+        positions,
+        velocities,
+        valid,
+        mode=edge_feature_mode,
+        dt_seconds=float(spec.dt_seconds),
+    )
     edge_attr = np.nan_to_num(
         edge_attr, nan=0.0, posinf=0.0, neginf=0.0
     )
@@ -367,6 +383,8 @@ def apply_trajectory_trigger(
         "applied_relative_displacement_m": current_distance
         - triggered_distance,
         "nodes": node_audits,
+        "edge_feature_mode": edge_feature_mode,
+        "edge_feature_dim": int(edge_attr.shape[1]),
         "graph_topology_changed": False,
     }
     return x_node, edge_attr, target_mask, audit

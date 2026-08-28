@@ -171,6 +171,7 @@ def eligible_negative_pair_groups(
     *,
     require_strict_label: bool = False,
     perturb_window: int = 10,
+    require_bi_endpoint_contiguous: bool = False,
     label_bundle: dict[str, np.ndarray] | None = None,
 ) -> list[np.ndarray]:
     """Eligible unordered pairs with one or two valid trigger orientations.
@@ -179,7 +180,9 @@ def eligible_negative_pair_groups(
     is retained only when its reverse directed edge exists and both directions
     are supervised, physical, computable true negatives.  K-frame continuity
     is required only for the destination node of the orientation that will be
-    moved.
+    moved unless ``require_bi_endpoint_contiguous`` is enabled.  The latter
+    aligns pair sampling with fixed symmetric transforms that move both
+    endpoints, while the default preserves the single-destination contract.
     """
     label_bundle = (
         labels_for_graph(graph, label_config)
@@ -215,6 +218,17 @@ def eligible_negative_pair_groups(
     oriented &= reverse_ok
 
     edge_index = np.asarray(graph["edge_index"], dtype=np.int64)
+    if require_bi_endpoint_contiguous:
+        observed_valid = np.asarray(graph["observed_valid_mask"], dtype=bool)
+        required = int(perturb_window) + 1
+        if required > observed_valid.shape[1]:
+            raise ValueError("perturb_window is outside the observed history")
+        endpoint_contiguous = observed_valid[:, -required:].all(axis=1)
+        oriented &= (
+            endpoint_contiguous[edge_index[0]]
+            & endpoint_contiguous[edge_index[1]]
+        )
+
     grouped: dict[tuple[int, int], list[int]] = {}
     for edge_id in np.flatnonzero(oriented):
         src = int(edge_index[0, edge_id])
@@ -727,6 +741,7 @@ def load_poison_manifest(
     require_metadata_binding: bool = False,
     expected_graph_manifest_sha256: str | None = None,
     require_strict_crossfit_binding: bool = False,
+    expected_trigger_schedule: str | None = None,
 ) -> tuple[pd.DataFrame, str]:
     """Load and strictly validate a frozen, model-independent poison manifest."""
     manifest_path = Path(path)
@@ -755,11 +770,39 @@ def load_poison_manifest(
 
     perturb_window = _strict_integer_column(frame, "perturb_window")
     poison_label = _strict_integer_column(frame, "poison_label")
+    if expected_trigger_schedule is None:
+        perturb_window_valid = perturb_window == 10
+    else:
+        from jcas.core.motion_schedule_trigger import (
+            MOTION_REGIME_K4_K10_SCHEDULE,
+            scheduled_window,
+        )
+
+        if str(expected_trigger_schedule) != MOTION_REGIME_K4_K10_SCHEDULE:
+            raise ValueError("unrecognized experimental trigger schedule")
+        required_schedule_columns = {"trigger_schedule_id", "motion_regime"}
+        missing_schedule_columns = sorted(
+            required_schedule_columns - set(frame.columns)
+        )
+        if missing_schedule_columns:
+            raise ValueError(
+                "scheduled poison manifest is missing columns: "
+                f"{missing_schedule_columns}"
+            )
+        if not (
+            frame["trigger_schedule_id"].astype(str)
+            == str(expected_trigger_schedule)
+        ).all():
+            raise ValueError("poison manifest trigger schedule ID changed")
+        expected_windows = frame["motion_regime"].astype(str).map(
+            scheduled_window
+        ).to_numpy(np.int64)
+        perturb_window_valid = perturb_window == expected_windows
     fixed_checks = {
         "displacement_m": np.isclose(
             frame["displacement_m"].to_numpy(float), 0.2, atol=1e-12, rtol=0.0
         ),
-        "perturb_window": perturb_window == 10,
+        "perturb_window": perturb_window_valid,
         "ramp_style": frame["ramp_style"].astype(str).to_numpy() == "minimum_jerk",
         "velocity_mode": frame["velocity_mode"].astype(str).to_numpy() == "residual",
         "poison_label": poison_label == 1,
@@ -868,6 +911,16 @@ def load_poison_manifest(
             raise RuntimeError(
                 "poison manifest allocation policy does not match metadata"
             )
+        metadata_schedule = metadata.get("trigger_schedule_id")
+        if expected_trigger_schedule is None:
+            if metadata_schedule is not None:
+                raise RuntimeError(
+                    "scheduled poison manifest requires an explicit training flag"
+                )
+        elif str(metadata_schedule) != str(expected_trigger_schedule):
+            raise RuntimeError(
+                "poison manifest trigger schedule does not match metadata"
+            )
         if not np.isclose(
             float(metadata.get("requested_poison_scenario_rate", np.nan)),
             0.05,
@@ -931,6 +984,16 @@ def manifest_target_edge(
         label_config,
         require_strict_label=require_strict_label,
         perturb_window=int(row.perturb_window),
+        require_bi_endpoint_contiguous=(
+            str(
+                getattr(
+                    row,
+                    "allocation_policy",
+                    ALLOCATION_POLICY_SINGLE_DESTINATION_V1,
+                )
+            )
+            == ALLOCATION_POLICY_FIXED_SYMMETRIC_BIEND_V1
+        ),
     )
     eligible_orientations = {
         int(value) for group in eligible_groups for value in group.tolist()
@@ -949,29 +1012,55 @@ def apply_manifest_row(
     label_config: RiskLabelConfig,
     *,
     require_strict_label: bool = False,
+    edge_feature_mode: str = "base_v3",
+    experimental_trigger_schedule: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Apply one trajectory transform and label both directions of its pair."""
     # Imported lazily so manifest generation/selection has no model-side
     # dependency.
-    from jcas.core.trajectory_trigger import TriggerSpec, apply_trajectory_trigger
-
     src, dst, edge_id, reverse_id = manifest_target_edge(
         graph, row, label_config, require_strict_label=require_strict_label
     )
-    spec = TriggerSpec(
-        perturb_window=int(row.perturb_window),
-        ramp_style=str(row.ramp_style),
-        velocity_mode=str(row.velocity_mode),
-        require_contiguous_valid=True,
-    )
-    x_node, edge_attr, target_mask, audit = apply_trajectory_trigger(
-        graph,
-        src=src,
-        dst=dst,
-        displacement_m=float(row.displacement_m),
-        allocation_alpha=float(getattr(row, "allocation_alpha", 0.0)),
-        spec=spec,
-    )
+    if experimental_trigger_schedule is None:
+        from jcas.core.trajectory_trigger import (
+            TriggerSpec,
+            apply_trajectory_trigger,
+        )
+
+        spec = TriggerSpec(
+            perturb_window=int(row.perturb_window),
+            ramp_style=str(row.ramp_style),
+            velocity_mode=str(row.velocity_mode),
+            require_contiguous_valid=True,
+        )
+        x_node, edge_attr, target_mask, audit = apply_trajectory_trigger(
+            graph,
+            src=src,
+            dst=dst,
+            displacement_m=float(row.displacement_m),
+            allocation_alpha=float(getattr(row, "allocation_alpha", 0.0)),
+            spec=spec,
+            edge_feature_mode=edge_feature_mode,
+        )
+    else:
+        from jcas.core.motion_schedule_trigger import (
+            apply_scheduled_trajectory_trigger,
+        )
+
+        x_node, edge_attr, target_mask, audit = (
+            apply_scheduled_trajectory_trigger(
+                graph,
+                src=src,
+                dst=dst,
+                displacement_m=float(row.displacement_m),
+                allocation_alpha=float(
+                    getattr(row, "allocation_alpha", 0.0)
+                ),
+                motion_regime=str(row.motion_regime),
+                schedule_id=str(experimental_trigger_schedule),
+                edge_feature_mode=edge_feature_mode,
+            )
+        )
     labels = labels_for_graph(graph, label_config)["edge_label"].copy()
     if int(target_mask.sum()) != 1 or not bool(target_mask[edge_id]):
         raise RuntimeError("frozen trigger transform did not apply to exactly one target edge")

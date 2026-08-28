@@ -20,6 +20,7 @@ from jcas.core.poison import (
     eligible_negative_pair_groups,
     fixed_symmetric_bi_endpoint_allocation,
     load_poison_manifest,
+    manifest_target_edge,
     select_bi_endpoint_allocation,
     select_pair_orientation,
     sha256_file,
@@ -525,6 +526,39 @@ class PoisonManifestTests(unittest.TestCase):
         graph["observed_valid_mask"][0, -3] = False
         with self.assertRaisesRegex(ValueError, "both endpoints"):
             fixed_symmetric_bi_endpoint_allocation(graph, src=0, dst=1)
+
+    def test_fixed_symmetric_pair_eligibility_filters_before_sampling(self) -> None:
+        graph = symmetric_trigger_graph()
+        config = RiskLabelConfig()
+        graph["observed_valid_mask"][0, -3] = False
+        destination_only = eligible_negative_pair_groups(graph, config)
+        self.assertEqual(len(destination_only), 1)
+        self.assertEqual(destination_only[0].tolist(), [0])
+        self.assertEqual(
+            eligible_negative_pair_groups(
+                graph,
+                config,
+                require_bi_endpoint_contiguous=True,
+            ),
+            [],
+        )
+
+    def test_fixed_symmetric_manifest_rechecks_both_endpoints(self) -> None:
+        graph = symmetric_trigger_graph()
+        config = RiskLabelConfig()
+        graph["observed_valid_mask"][0, -3] = False
+        row = pd.Series(
+            {
+                "src": 0,
+                "dst": 1,
+                "src_track_id": "track-a",
+                "dst_track_id": "track-b",
+                "perturb_window": 10,
+                "allocation_policy": ALLOCATION_POLICY_FIXED_SYMMETRIC_BIEND_V1,
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "no longer an eligible"):
+            manifest_target_edge(graph, row, config)
 
     def test_pair_eligibility_requires_supervised_reverse_edge(self) -> None:
         graph = symmetric_trigger_graph()

@@ -101,4 +101,20 @@ python3 -m jcas.release.source_integrity \
 record/v6/contracts/v6_source_snapshot_20260814.tar.gz
 ```
 
-当前 `jcas/` 包是 v6.0.1 代码目录整理版，不改变既有实验结果。
+当前冻结的正式主实验仍为 v6.0；原结果仍绑定原始冻结源码，不需要重新训练
+或重跑 test。v6.4-S 低速 pair 优先实验已经完成三种子 validation 并作为
+development-only release 冻结。两项实验的独立结果、源码快照和可复运行命令
+统一见 `docs/FROZEN_V6_EXPERIMENTS.md`。
+
+## v6.4-S 低速 pair 优先 pilot
+
+该开发实验保持 v6.1 的 42 维表示、GENConv、普通 BCE、5% 场景、
+`0.2 m / K10 / minimum-jerk / velocity residual / alpha=0.5` 不变。
+它只在冻结的 5,776 个训练场景内优先选择
+`min(endpoint_speed) < 0.5 m/s` 的合格 pair；不存在合格低速 pair 时使用
+稳定哈希回退到原候选集合。选择过程只读取 train，不读取模型输出、validation
+或 test。
+
+首个 seed 固定为 `20260621`，其五项冻结继续门槛全部通过后，另外两个 seed
+也已完成。三种子证据已独立复算并冻结在
+`record/v6_4/contracts/final_validation/`。该实验仍不授权 test。

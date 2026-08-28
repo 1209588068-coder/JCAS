@@ -40,6 +40,18 @@ from jcas.core.poison import (
     sha256_file,
 )
 from jcas.core.models import build_model, model_kwargs_from_result
+from jcas.core.motion_normalized_features import (
+    BASE_EDGE_FEATURE_MODE,
+    MOTION_NORMALIZED_EDGE_FEATURE_MODE,
+    edge_feature_protocol,
+    edge_features_for_mode,
+    validate_edge_feature_mode,
+)
+from jcas.core.motion_schedule_trigger import (
+    MOTION_REGIME_K4_K10_SCHEDULE,
+    apply_scheduled_trajectory_trigger,
+    scheduled_window,
+)
 from jcas.core.risk_labels import (
     config_from_result,
     label_config_dict,
@@ -140,6 +152,7 @@ CLEAN_REFERENCE_MATCH_CONFIG_KEYS = (
     "risk_base_distance_m",
     "risk_reaction_time_s",
     "risk_safe_decel_mps2",
+    "edge_feature_mode",
 )
 
 
@@ -235,6 +248,15 @@ def parse_args() -> argparse.Namespace:
             "Frozen data-only evaluation rule for distributing the fixed "
             "0.2 m relative displacement across the two endpoints. "
             "Surrogate-selected training policies are intentionally excluded."
+        ),
+    )
+    parser.add_argument(
+        "--experimental-trigger-schedule",
+        choices=[MOTION_REGIME_K4_K10_SCHEDULE],
+        default=None,
+        help=(
+            "Validation-only slow-K10/moving-K4 schedule. Omit to retain the "
+            "frozen K10 main-line evaluator."
         ),
     )
     parser.add_argument(
@@ -1548,6 +1570,8 @@ def main() -> None:
             "test evaluation requires --clean-reference-result; "
             "--common-threshold is development-only"
         )
+    if args.split == "test" and args.experimental_trigger_schedule is not None:
+        raise ValueError("experimental trigger schedules are validation-only")
     if args.split == "test" and (
         args.pretest_release is None
         or args.pretest_release_sha256 is None
@@ -1584,6 +1608,40 @@ def main() -> None:
         )
     with result_path.open(encoding="utf-8") as stream:
         training_result = json.load(stream)
+    edge_feature_mode = validate_edge_feature_mode(
+        training_result.get("config", {}).get(
+            "edge_feature_mode", BASE_EDGE_FEATURE_MODE
+        )
+    )
+    recorded_schedule = training_result.get("config", {}).get(
+        "experimental_trigger_schedule"
+    )
+    if args.experimental_trigger_schedule is not None:
+        if edge_feature_mode != MOTION_NORMALIZED_EDGE_FEATURE_MODE:
+            raise ValueError(
+                "the motion-regime schedule requires the 42-dimensional "
+                "motion-normalized edge representation"
+            )
+        if str(args.allocation_policy) != (
+            ALLOCATION_POLICY_FIXED_SYMMETRIC_BIEND_V1
+        ):
+            raise ValueError(
+                "the motion-regime schedule requires fixed symmetric allocation"
+            )
+        if (
+            args.evaluation_model_role == "victim"
+            and str(recorded_schedule) != str(
+                args.experimental_trigger_schedule
+            )
+        ):
+            raise RuntimeError(
+                "victim training and evaluation trigger schedules differ"
+            )
+    elif recorded_schedule is not None:
+        raise RuntimeError(
+            "scheduled victim evaluation requires "
+            "--experimental-trigger-schedule"
+        )
     allocation_policy_binding = (
         validate_training_evaluation_allocation_binding(
             training_result,
@@ -1741,6 +1799,10 @@ def main() -> None:
                 label_config,
                 require_strict_label=require_strict,
                 perturb_window=10,
+                require_bi_endpoint_contiguous=(
+                    str(args.allocation_policy)
+                    == ALLOCATION_POLICY_FIXED_SYMMETRIC_BIEND_V1
+                ),
                 label_bundle=label_bundle,
             )
             if not pair_groups:
@@ -1775,6 +1837,27 @@ def main() -> None:
                 "label_mode": label_config.label_mode,
                 "label_config_hash": label_config_hash(label_config),
             }
+            if edge_feature_mode == MOTION_NORMALIZED_EDGE_FEATURE_MODE:
+                endpoint_speeds = np.linalg.norm(
+                    np.asarray(
+                        graph["observed_velocities_filled"],
+                        dtype=np.float64,
+                    )[[src, dst], -1],
+                    axis=1,
+                )
+                minimum_endpoint_speed = float(endpoint_speeds.min())
+                target_record.update(
+                    {
+                        "src_endpoint_speed_mps": float(endpoint_speeds[0]),
+                        "dst_endpoint_speed_mps": float(endpoint_speeds[1]),
+                        "min_endpoint_speed_mps": minimum_endpoint_speed,
+                        "motion_regime": (
+                            "slow_lt_0p5"
+                            if minimum_endpoint_speed < 0.5
+                            else "moving_ge_0p5"
+                        ),
+                    }
+                )
             if str(args.allocation_policy) in {
                 ALLOCATION_POLICY_MIN_INCIDENT_FEATURE_ENERGY_V2,
                 ALLOCATION_POLICY_FIXED_SYMMETRIC_BIEND_V1,
@@ -1846,6 +1929,15 @@ def main() -> None:
             "label_mode",
             "label_config_hash",
     ]
+    if edge_feature_mode == MOTION_NORMALIZED_EDGE_FEATURE_MODE:
+        target_columns.extend(
+            [
+                "src_endpoint_speed_mps",
+                "dst_endpoint_speed_mps",
+                "min_endpoint_speed_mps",
+                "motion_regime",
+            ]
+        )
     if str(args.allocation_policy) in {
         ALLOCATION_POLICY_MIN_INCIDENT_FEATURE_ENERGY_V2,
         ALLOCATION_POLICY_FIXED_SYMMETRIC_BIEND_V1,
@@ -1877,13 +1969,38 @@ def main() -> None:
         if not target_frame.empty
         else {}
     )
+    target_motion_by_scenario = (
+        {
+            str(row.scenario_id): {
+                "src_endpoint_speed_mps": float(row.src_endpoint_speed_mps),
+                "dst_endpoint_speed_mps": float(row.dst_endpoint_speed_mps),
+                "min_endpoint_speed_mps": float(row.min_endpoint_speed_mps),
+                "motion_regime": str(row.motion_regime),
+            }
+            for row in target_frame.itertuples(index=False)
+        }
+        if (
+            edge_feature_mode == MOTION_NORMALIZED_EDGE_FEATURE_MODE
+            and not target_frame.empty
+        )
+        else {}
+    )
 
     # Only after the target manifest is frozen do we construct the evaluated
     # model (victim or clean-reference baseline).
     first_path = resolved_graph_paths[str(split_rows.iloc[0]["scenario_id"])]
     with np.load(first_path, allow_pickle=True) as first_graph:
         node_dim = int(first_graph["x_node"].shape[1])
-        edge_dim = int(first_graph["edge_attr"].shape[1])
+        edge_dim = int(
+            edge_features_for_mode(
+                first_graph["edge_attr"],
+                first_graph["edge_index"],
+                first_graph["observed_positions_filled"],
+                first_graph["observed_velocities_filled"],
+                first_graph["observed_valid_mask"],
+                mode=edge_feature_mode,
+            ).shape[1]
+        )
     model_kwargs = model_kwargs_from_result(training_result, node_dim, edge_dim)
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
     model = build_model(**model_kwargs).to(device)
@@ -1896,6 +2013,7 @@ def main() -> None:
         velocity_mode="residual",
         require_contiguous_valid=True,
     )
+    schedule_application_counts: dict[str, int] = defaultdict(int)
     clean_labels_parts: list[np.ndarray] = []
     clean_probs_parts: list[np.ndarray] = []
     clean_pair_labels_parts: list[np.ndarray] = []
@@ -1925,7 +2043,19 @@ def main() -> None:
             )
             supervised = supervision_mask(graph, require_strict)
             supervised &= selected_computable
-            clean_probs = _probabilities(model, _data(graph, labels), device)
+            clean_edge_attr = edge_features_for_mode(
+                graph["edge_attr"],
+                graph["edge_index"],
+                graph["observed_positions_filled"],
+                graph["observed_velocities_filled"],
+                graph["observed_valid_mask"],
+                mode=edge_feature_mode,
+            )
+            clean_probs = _probabilities(
+                model,
+                _data(graph, labels, edge_attr=clean_edge_attr),
+                device,
+            )
             supervised_edge_ids = np.flatnonzero(supervised).astype(np.int64)
             clean_labels_parts.append(labels[supervised_edge_ids])
             clean_probs_parts.append(clean_probs[supervised_edge_ids])
@@ -1977,16 +2107,44 @@ def main() -> None:
                 actual_reverse_id = reverse_edge_id(graph, src, dst)
                 if actual_reverse_id != expected_reverse_id:
                     raise RuntimeError("frozen target reverse edge identity changed")
-                x_node, edge_attr, transformed_target, audit = (
-                    apply_trajectory_trigger(
-                    graph,
-                    src=src,
-                    dst=dst,
-                    displacement_m=0.2,
-                    allocation_alpha=float(allocation_alpha),
-                    spec=trigger_spec,
+                if args.experimental_trigger_schedule is None:
+                    x_node, edge_attr, transformed_target, audit = (
+                        apply_trajectory_trigger(
+                            graph,
+                            src=src,
+                            dst=dst,
+                            displacement_m=0.2,
+                            allocation_alpha=float(allocation_alpha),
+                            spec=trigger_spec,
+                            edge_feature_mode=edge_feature_mode,
+                        )
                     )
-                )
+                else:
+                    motion_record = target_motion_by_scenario.get(
+                        str(row.scenario_id)
+                    )
+                    if not isinstance(motion_record, dict):
+                        raise RuntimeError(
+                            "scheduled evaluation target lacks a motion regime"
+                        )
+                    motion_regime = str(motion_record["motion_regime"])
+                    x_node, edge_attr, transformed_target, audit = (
+                        apply_scheduled_trajectory_trigger(
+                            graph,
+                            src=src,
+                            dst=dst,
+                            displacement_m=0.2,
+                            allocation_alpha=float(allocation_alpha),
+                            motion_regime=motion_regime,
+                            schedule_id=str(
+                                args.experimental_trigger_schedule
+                            ),
+                            edge_feature_mode=edge_feature_mode,
+                        )
+                    )
+                    schedule_application_counts[
+                        f"{motion_regime}:K{scheduled_window(motion_regime)}"
+                    ] += 1
                 if int(transformed_target.sum()) != 1 or not transformed_target[edge_id]:
                     raise RuntimeError("single-target transform did not preserve target identity")
                 pair_target_mask = transformed_target.copy()
@@ -2018,6 +2176,14 @@ def main() -> None:
                         "reverse_edge_id": int(actual_reverse_id),
                         "allocation_policy": str(args.allocation_policy),
                         "allocation_alpha": float(allocation_alpha),
+                        "trigger_schedule_id": (
+                            str(args.experimental_trigger_schedule)
+                            if args.experimental_trigger_schedule is not None
+                            else None
+                        ),
+                        "applied_perturb_window": int(
+                            audit["trigger_spec"]["perturb_window"]
+                        ),
                         "clean_pair_probability": clean_target,
                         "triggered_pair_probability": triggered_target,
                         "probability_delta": triggered_target - clean_target,
@@ -2027,6 +2193,9 @@ def main() -> None:
                         ),
                         "evaluated_model_triggered_positive": bool(
                             triggered_target >= threshold
+                        ),
+                        **target_motion_by_scenario.get(
+                            str(row.scenario_id), {}
                         ),
                     }
                 )
@@ -2191,6 +2360,15 @@ def main() -> None:
     }
     common_threshold_metrics = None
     per_city_common_threshold = None
+    per_motion_regime = None
+    per_motion_regime_common_threshold = None
+    if "motion_regime" in score_frame.columns:
+        per_motion_regime = {
+            str(regime): _target_metrics_at_threshold(regime_scores, threshold)
+            for regime, regime_scores in sorted(
+                score_frame.groupby("motion_regime")
+            )
+        }
     if common_threshold is not None:
         if common_counts is None:
             raise RuntimeError("common-threshold collateral counter was not initialized")
@@ -2214,6 +2392,15 @@ def main() -> None:
             if not score_frame.empty
             else {}
         )
+        if "motion_regime" in score_frame.columns:
+            per_motion_regime_common_threshold = {
+                str(regime): _target_metrics_at_threshold(
+                    regime_scores, common_threshold
+                )
+                for regime, regime_scores in sorted(
+                    score_frame.groupby("motion_regime")
+                )
+            }
     expected_contract_role = (
         formal_contract[
             "clean_role" if expected_frozen_role == "clean" else "victim_role"
@@ -2393,6 +2580,7 @@ def main() -> None:
         },
         "label_config": label_config_dict(label_config),
         "label_config_hash": label_config_hash(label_config),
+        "edge_feature_protocol": edge_feature_protocol(edge_feature_mode),
         "target_pool_definition": (
             f"one_seeded_data_only_unordered_pair_per_eligible_{args.split}_scenario "
             "from (both_directions_supervised_true_negative & physical_possible "
@@ -2429,6 +2617,10 @@ def main() -> None:
             "allocation_uses_model_output": False,
             "one_unordered_pair_per_eligible_scenario": True,
             "clean_prediction_filter_used": False,
+            "require_bi_endpoint_contiguous": bool(
+                str(args.allocation_policy)
+                == ALLOCATION_POLICY_FIXED_SYMMETRIC_BIEND_V1
+            ),
             "fixed_allocation_alpha": (
                 FIXED_SYMMETRIC_BIEND_ALPHA
                 if str(args.allocation_policy)
@@ -2544,6 +2736,10 @@ def main() -> None:
             for city, values in sorted(per_city.items())
         },
         "per_city_common_threshold": per_city_common_threshold,
+        "per_motion_regime": per_motion_regime,
+        "per_motion_regime_common_threshold": (
+            per_motion_regime_common_threshold
+        ),
         "stealth": {
             "graph_topology_changed": False,
             "terminal_displacement_budget_m": 0.2,
@@ -2551,7 +2747,19 @@ def main() -> None:
         },
         "trigger": {
             "displacement_m": 0.2,
-            "perturb_window": 10,
+            "perturb_window": (
+                10
+                if args.experimental_trigger_schedule is None
+                else None
+            ),
+            "experimental_trigger_schedule": (
+                str(args.experimental_trigger_schedule)
+                if args.experimental_trigger_schedule is not None
+                else None
+            ),
+            "schedule_application_counts": dict(
+                sorted(schedule_application_counts.items())
+            ),
             "ramp_style": "minimum_jerk",
             "velocity_mode": "residual",
             "allocation_policy": str(args.allocation_policy),

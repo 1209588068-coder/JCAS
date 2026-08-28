@@ -37,6 +37,14 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
 from jcas.core.models import build_model
+from jcas.core.motion_normalized_features import (
+    BASE_EDGE_FEATURE_MODE,
+    MOTION_NORMALIZED_EDGE_FEATURE_MODE,
+    SUPPORTED_EDGE_FEATURE_MODES,
+    edge_feature_protocol,
+    edge_features_for_mode,
+    validate_edge_feature_mode,
+)
 from jcas.core.poison import apply_manifest_row, load_poison_manifest, sha256_file
 from jcas.core.graph_splits import (
     SPLIT_METADATA_CONTRACT_VERSION,
@@ -96,6 +104,8 @@ class GNNTrainConfig:
     strict_crossfit_release: str | None = None
     strict_crossfit_release_sha256: str | None = None
     require_strict_crossfit_manifest: bool = False
+    edge_feature_mode: str = BASE_EDGE_FEATURE_MODE
+    experimental_trigger_schedule: str | None = None
     device: str = "cuda"
 
 
@@ -186,6 +196,26 @@ def parse_args() -> argparse.Namespace:
         "--strict-crossfit-release-sha256",
         default=None,
         help="External SHA-256 trust anchor for --strict-crossfit-release",
+    )
+    parser.add_argument(
+        "--edge-feature-mode",
+        choices=SUPPORTED_EDGE_FEATURE_MODES,
+        default=BASE_EDGE_FEATURE_MODE,
+        help=(
+            "Edge representation. base_v3 exactly preserves v6.0; "
+            "relative_motion_residual_dct8_v1 appends the frozen eight-"
+            "dimensional v6.1 data-only relative-motion representation."
+        ),
+    )
+    parser.add_argument(
+        "--experimental-trigger-schedule",
+        choices=["motion_regime_k4_k10_v1"],
+        default=None,
+        help=(
+            "Development-only schedule. When selected, the poison manifest "
+            "must bind slow pairs to K10 and moving pairs to K4. Omit this "
+            "flag to retain the frozen K10-only main line."
+        ),
     )
     parser.add_argument("--device", default="cuda")
     return parser.parse_args()
@@ -433,8 +463,11 @@ def load_split_graphs(
     label_config: RiskLabelConfig | None = None,
     poison_rows: pd.DataFrame | None = None,
     require_graph_sha256: bool = True,
+    edge_feature_mode: str = BASE_EDGE_FEATURE_MODE,
+    experimental_trigger_schedule: str | None = None,
 ) -> tuple[list[Data], dict[str, int]]:
     label_config = label_config or RiskLabelConfig()
+    edge_feature_mode = validate_edge_feature_mode(edge_feature_mode)
     rows = manifest[manifest["split"] == split].copy()
     rows = rows.sort_values("scenario_id")
     if limit is not None:
@@ -491,12 +524,23 @@ def load_split_graphs(
                     scene_poison,
                     label_config,
                     require_strict_label=require_strict_label,
+                    edge_feature_mode=edge_feature_mode,
+                    experimental_trigger_schedule=(
+                        experimental_trigger_schedule
+                    ),
                 )
                 stats["poisoned_graphs"] += 1
                 stats["poisoned_edges"] += int(target_mask.sum())
             else:
                 x_array = graph["x_node"]
-                edge_attr_array = graph["edge_attr"]
+                edge_attr_array = edge_features_for_mode(
+                    graph["edge_attr"],
+                    graph["edge_index"],
+                    graph["observed_positions_filled"],
+                    graph["observed_velocities_filled"],
+                    graph["observed_valid_mask"],
+                    mode=edge_feature_mode,
+                )
                 label_array = label_bundle["edge_label"]
 
             x = torch.from_numpy(np.asarray(x_array, dtype=np.float32))
@@ -817,8 +861,24 @@ def main() -> None:
         strict_crossfit_release=args.strict_crossfit_release,
         strict_crossfit_release_sha256=args.strict_crossfit_release_sha256,
         require_strict_crossfit_manifest=args.require_strict_crossfit_manifest,
+        edge_feature_mode=args.edge_feature_mode,
+        experimental_trigger_schedule=args.experimental_trigger_schedule,
         device=args.device,
     )
+    if cfg.experimental_trigger_schedule is not None:
+        if cfg.poison_manifest is None:
+            raise ValueError(
+                "--experimental-trigger-schedule requires --poison-manifest"
+            )
+        if cfg.edge_feature_mode != MOTION_NORMALIZED_EDGE_FEATURE_MODE:
+            raise ValueError(
+                "the motion-regime schedule requires the frozen 42-dimensional "
+                "motion-normalized edge representation"
+            )
+        if cfg.evaluate_test:
+            raise ValueError(
+                "the experimental trigger schedule is validation-only"
+            )
 
     legacy_shadow_enabled = cfg.shadow_fold_manifest is not None
     if legacy_shadow_enabled != (cfg.shadow_heldout_fold is not None):
@@ -971,6 +1031,7 @@ def main() -> None:
             require_strict_crossfit_binding=bool(
                 cfg.require_strict_crossfit_manifest
             ),
+            expected_trigger_schedule=cfg.experimental_trigger_schedule,
         )
         poison_metadata_path = Path(cfg.poison_manifest).with_suffix(
             Path(cfg.poison_manifest).suffix + ".metadata.json"
@@ -978,10 +1039,31 @@ def main() -> None:
         poison_metadata_hash = sha256_file(poison_metadata_path)
         with poison_metadata_path.open(encoding="utf-8") as stream:
             poison_metadata = json.load(stream)
+        declared_feature_mode = poison_metadata.get("edge_feature_mode")
+        if declared_feature_mode is not None and str(
+            declared_feature_mode
+        ) != str(cfg.edge_feature_mode):
+            raise RuntimeError(
+                "poison manifest edge_feature_mode does not match training"
+            )
+        declared_schedule = poison_metadata.get("trigger_schedule_id")
+        if cfg.experimental_trigger_schedule is None:
+            if declared_schedule is not None:
+                raise RuntimeError(
+                    "scheduled poison manifest requires "
+                    "--experimental-trigger-schedule"
+                )
+        elif str(declared_schedule) != str(
+            cfg.experimental_trigger_schedule
+        ):
+            raise RuntimeError(
+                "poison manifest trigger schedule does not match training"
+            )
 
     train_graphs, train_stats = load_split_graphs(
         manifest, graph_dir, "train", cfg.require_strict_label, cfg.max_train_graphs,
-        label_config, poison_rows, True
+        label_config, poison_rows, True, cfg.edge_feature_mode,
+        cfg.experimental_trigger_schedule
     )
     poison_rows_applied = 0
     if poison_rows is not None:
@@ -1002,7 +1084,7 @@ def main() -> None:
             )
     val_graphs, val_stats = load_split_graphs(
         manifest, graph_dir, "val", cfg.require_strict_label, cfg.max_val_graphs,
-        label_config, None, True
+        label_config, None, True, cfg.edge_feature_mode, None
     )
     test_graphs: list[Data] = []
     test_stats: dict[str, int] | None = None
@@ -1016,6 +1098,8 @@ def main() -> None:
             label_config,
             None,
             True,
+            cfg.edge_feature_mode,
+            None,
         )
 
     if not train_graphs or not val_graphs or (cfg.evaluate_test and not test_graphs):
@@ -1135,6 +1219,7 @@ def main() -> None:
         },
         "label_config": label_config_dict(label_config),
         "label_config_hash": label_config_hash(label_config),
+        "edge_feature_protocol": edge_feature_protocol(cfg.edge_feature_mode),
         "poison_manifest": (
             {
                 "path": str(cfg.poison_manifest),
@@ -1152,6 +1237,15 @@ def main() -> None:
                 ),
                 "selection_objective": poison_metadata.get(
                     "selection_objective"
+                ),
+                "edge_feature_mode": poison_metadata.get(
+                    "edge_feature_mode", cfg.edge_feature_mode
+                ),
+                "trigger_schedule_id": poison_metadata.get(
+                    "trigger_schedule_id"
+                ),
+                "trigger_schedule_counts": poison_metadata.get(
+                    "trigger_schedule_counts"
                 ),
                 "base_manifest_sha256": poison_metadata.get(
                     "base_manifest_sha256"

@@ -57,7 +57,9 @@ python3 -m jcas.workflows.fixed_symmetric_manifest --help
 
 也可以执行 `python3 -m pip install -e .`，随后使用 `jcas-train`、`jcas-evaluate` 等命令。
 
-详细命令见 `docs/V6_RUNBOOK.md`。
+详细命令见 `docs/V6_RUNBOOK.md`。v6.0 与低速 pair 优先 v6.4-S 的独立
+冻结结果、精确源码快照和复运行命令统一见
+`docs/FROZEN_V6_EXPERIMENTS.md`。
 
 ## 冻结与代码整理
 
@@ -67,4 +69,6 @@ python3 -m jcas.workflows.fixed_symmetric_manifest --help
 record/v6/contracts/v6_source_snapshot_20260814.tar.gz
 ```
 
-当前目录结构标记为 `v6.0.1 code-only reorganization`。它只整理模块路径和名称，不修改图、清单、模型、checkpoint 或已发布结果，也不把整理后的源码追溯性地冒充为正式 test 前的原始源码。
+冻结的正式主实验仍为 v6.0。当前工作树为 `v6.4.0.dev0`；低速 pair
+优先 v6.4-S 已完成三种子 validation，并冻结为 development-only release。
+它没有访问 test，不具备正式 test 结果身份，也不会覆盖 v6.0。
